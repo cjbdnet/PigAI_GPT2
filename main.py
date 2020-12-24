@@ -5,6 +5,7 @@ monkey.patch_all()
 import time
 import re
 import csv
+from datetime import datetime
 
 import yaml
 from yaml.parser import ParserError
@@ -37,6 +38,9 @@ class ActionTraceSpider(object):
 
         # 批改网用户信息
         self.score, self.title, self.stu_num, self.stu_name = [''] * 4
+
+        # eid
+        self.end_html = ''
 
     def load_params(self, username, password, pid, text, class_name=''):
         self.silence = SILENCE
@@ -105,6 +109,18 @@ class ActionTraceSpider(object):
             # 有反爬虫/默认：一般模式启动
             return Chrome(options=options, executable_path=CHROMEDRIVER_PATH)
 
+    @staticmethod
+    def save_cookies(api: Chrome):
+        pending = False
+        try:
+            cookies = api.get_cookies()
+            import json
+            with open('./database/cookies.txt', 'w', encoding='utf-8') as f:
+                f.write(json.dumps(cookies))
+            pending = True
+        finally:
+            print('>>> Task over: save cookies ' if pending else '>>> Task failed: save cookie')
+
     def login(self, api: Chrome, url, username, password):
         try:
             api.get(url)
@@ -122,7 +138,6 @@ class ActionTraceSpider(object):
     def switch_workspace(self, api: Chrome, work_id: str):
 
         self.wait(api, 5, 'all')
-
         api.find_element_by_name('rid').click()
         api.find_element_by_name('rid').send_keys(work_id)
         api.find_element_by_class_name('sf_right').click()
@@ -141,7 +156,7 @@ class ActionTraceSpider(object):
             self.stu_num = [i.split(':')[-1] for i in re.split('[，。]', info) if '学号' in i][0]
             self.stu_name = api.find_element_by_id('pigai_name').text
         except NoSuchElementException:
-            print('>>> [ERROR] 作文号不存在 ||get student info failed.')
+            print('>>> [ERROR] No paper number || Get student info failed.')
 
     def submit(self, api: Chrome):
         api.find_element_by_id('dafen').click()
@@ -177,17 +192,69 @@ class ActionTraceSpider(object):
             self.wait(api, 10, "//div[@id='scoreCricle']")
             time.sleep(5)
             self.score = api.find_element_by_xpath("//div[@id='scoreCricle']").text
+            self.end_html = api.current_url
         except TimeoutException:
             print('作文提交失败|| 可能原因为：重复提交')
             return None
 
-    def over(self):
+    def save_action_history(self, api: Chrome):
+        create_pending = True
+        capture_pending = False
+        add_pending = False
+
+        # 当前时间
+        now_ = str(datetime.now(TIMEZONE_CN)).split('.')[0]
+        # 范式一：数据漏采--token替换
+        score = self.score if self.score else 'none'
+        stu_name = self.stu_name if self.stu_name else 'none'
+        stu_num = self.stu_num if self.stu_num else 'none'
+        # 范式二：捕获评分页面--输出地址
+        end_html = '《{}》_{}_{}.mhtml'.format(self.title, self.end_html.split('=')[-1], now_.replace(':', '-'))
+        filename_mhtml = os.path.join(ROOT_DIR_PAPER_SCORE, end_html)
+        try:
+            if not os.path.exists(ROOT_PATH_ACTION_HISTORY):
+                with open(ROOT_PATH_ACTION_HISTORY, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['publish_time', 'stu_name', 'stu_num', 'pid', 'title', 'score', 'end_html'])
+                    print('>>> Task over: create action_history.')
+        except FileNotFoundError as e:
+            print(e)
+            return None
+
+        try:
+            res = api.execute_cdp_cmd('Page.captureSnapshot', {})
+
+            with open(filename_mhtml, 'w', newline='') as f:
+                html = res.get('data')
+                if html:
+                    f.write(html)
+                    capture_pending = True
+                else:
+                    error_msg = ' The  MTH message is empty: {}'.format(self.pid)
+        finally:
+            task_name = '>>> Task {}: capture end_rid paper score.'
+            print(task_name.format('over') if capture_pending else task_name.format('failed'))
+
+        try:
+            with open(ROOT_PATH_ACTION_HISTORY, 'a', encoding='utf8', newline='', errors='ignore') as f:
+                writer = csv.writer(f)
+
+                writer.writerow([now_, stu_name, stu_num, self.pid, self.title, score, filename_mhtml])
+            add_pending = True
+        finally:
+            task_name = '>>> Task {}: ADD action history.'
+            print(task_name.format('over') if add_pending else task_name.format('failed'))
+
+    def over(self, api):
         print('>>', ''.center(30, '='), '<<')
         print(f'>>> 用户名: {self.stu_name}')
         print(f'>>> PID: {self.title}')
         print(f'>>> 学号: {self.stu_num}')
         print(f'>>> 得分:{self.score}' if self.score else f'>>> 作文异常')
         print('>>', ''.center(30, '='), '<<')
+
+        self.save_cookies(api)
+        self.save_action_history(api)
 
     def run(self):
         with self.set_spiderOption() as api:
@@ -209,14 +276,13 @@ class ActionTraceSpider(object):
 
                 self.get_paper_score(api)
 
-                self.over()
+                self.over(api)
 
-            except NoSuchElementException as e:
+            except NoSuchElementException:
                 print('>>> [PANIC] 提交异常')
-                # print('>> [PANIC] {}'.format(e))
-                # print(f'>> [PANIC] username: {self.username} ||Incorrect account or password setting.<<')
             finally:
                 global_lock()
+                api.quit()
                 print('>>> 工作栈已释放完毕.')
 
 
@@ -247,7 +313,7 @@ class PigAI(object):
     @staticmethod
     def youdao_cn2en(cn_word: str) -> str or None:
         """
-        备选方案，调用youdaoAPI接口实现文本翻译
+        备选方案，逆向有道翻译接口实现文本翻译
         :param cn_word:
         :return:
         """
@@ -316,11 +382,15 @@ class Middleware(object):
     def load_sample_text(file_path: str = ROOT_PATH_SENTENCE_DEFAULT, deep_learning=False) -> str:
         if deep_learning:
             pass
+            # with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            #     # Title: [id, sentence]
+            #     data = [i for i in csv.reader(f)][1:][-1]
+            #     text = data[-1] if len(data) == 2 else ','.join(data[1:])
+            #     print(text)
+            #     return text
         else:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # Title: [id, sentence]
-                data = [i for i in csv.reader(f)][1:]
-                return data[-1][-1]
+            from database.fake_corpus.load_fake_data import generate_fake_text
+            return generate_fake_text()['text']
 
     @staticmethod
     def load_workspace(username, password, workspace: ActionTraceSpider, **kwargs):
@@ -421,11 +491,15 @@ class Middleware(object):
         else:
             return False
 
-    def run(self, USE_AI_Model=False):
+    def run(self, use_AI_Module=False):
         try:
+            if use_AI_Module:
+                raise UnknownMethodException
             # PigAI().__str__()
             self.load_user_config()
             self.do_middleware_engine()
+        except UnknownMethodException:
+            print('>>> [INFO] 任务强制结束，未载入文本生成模型！')
         except WebDriverException or SessionNotCreatedException:
             print('>>> [INFO] 任务强制结束')
 
@@ -440,6 +514,6 @@ def global_lock():
 # 欢迎使用PigAI #
 if __name__ == '__main__':
     try:
-        Middleware().run(USE_AI_Model=False)
+        Middleware().run(use_AI_Module=False)
     except Exception as e:
         print(f'An unknown error occurred || {e}'.center(30, '='))
